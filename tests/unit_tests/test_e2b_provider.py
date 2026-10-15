@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from nemo_gym.package_info import __version__ as nemo_gym_version
+from nemo_gym.rollout_correlation import rollout_context, tool_call_context
 from nemo_gym.sandbox import AsyncSandbox, ConnectableProvider
 from nemo_gym.sandbox.providers import e2b as e2b_pkg
 from nemo_gym.sandbox.providers.base import SandboxHandle, SandboxSpec, SandboxStatus
@@ -884,6 +885,27 @@ class TestCreateAndLifecycle:
         connected = await AsyncSandbox.connect(descriptor, provider=connected_provider)
         await connected.exec("pwd")
         assert FakeSandbox.instances[-1].exec_calls[-1]["cwd"] == "/repo"
+
+    async def test_rollout_context_becomes_sandbox_metadata_and_exec_fields(self) -> None:
+        provider = E2BProvider(create={"template": "base"})
+        with rollout_context("4-2"), tool_call_context("call_abc"):
+            sandbox = await AsyncSandbox(provider, _spec(metadata={"run": "1"})).start()
+            result = await sandbox.exec("ls")
+
+        create_kwargs = FakeSandbox.instances[0].create_kwargs
+        assert create_kwargs["metadata"] == {
+            "nemo-gym.nvidia.com/rollout-id": "4-2",
+            "nemo-gym.nvidia.com/tool-call-id": "call_abc",
+            "run": "1",
+        }
+        # Metadata is control-plane only: the sandbox's own environment is unchanged.
+        assert "envs" not in create_kwargs
+        assert (result.rollout_id, result.tool_call_id) == ("4-2", "call_abc")
+
+    async def test_no_metadata_is_sent_outside_a_rollout(self) -> None:
+        await AsyncSandbox(E2BProvider(create={"template": "base"}), _spec()).start()
+
+        assert "metadata" not in FakeSandbox.instances[0].create_kwargs
 
     async def test_aclose_is_a_noop(self) -> None:
         assert await E2BProvider().aclose() is None

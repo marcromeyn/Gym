@@ -24,6 +24,7 @@ import time
 import warnings
 from abc import abstractmethod
 from asyncio.exceptions import CancelledError
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from functools import partial
 from importlib import import_module
@@ -34,6 +35,7 @@ from pathlib import Path
 from threading import Thread
 from traceback import format_exc, print_exc
 from typing import Any, ClassVar, List, Literal, NamedTuple, Optional, TextIO, Tuple, Type, Union, Unpack
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import orjson
@@ -86,7 +88,12 @@ from nemo_gym.global_config import (
     get_global_config_dict,
 )
 from nemo_gym.profiling import Profiler
-from nemo_gym.rollout_correlation import current_rollout_id, maybe_rollout_id_from_run_body
+from nemo_gym.rollout_correlation import (
+    TOOL_CALL_ID_HEADER,
+    current_rollout_id,
+    current_tool_call_id,
+    maybe_rollout_id_from_run_body,
+)
 from nemo_gym.telemetry._fallbacks import is_span_group_enabled, safe_set_span_attributes
 from nemo_gym.telemetry.connection_pool import (
     QueueTimedTCPConnector,
@@ -952,6 +959,10 @@ class ServerClient(BaseModel):
                 rollout_id = rollout_id or maybe_rollout_id_from_run_body(json_obj)
             if rollout_id is not None and not url_path.startswith(f"/{ROLLOUT_PATH_PREFIX}/"):
                 url_path = f"{rollout_path_prefix(rollout_id)}{url_path}"
+            tool_call_id = current_tool_call_id()
+            if rollout_id is not None and tool_call_id is not None:
+                # The Resources Server's RolloutContextMiddleware exposes it to sandbox calls for this tool.
+                kwargs["headers"] = {**dict(kwargs.get("headers") or {}), TOOL_CALL_ID_HEADER: tool_call_id}
 
         if (
             rollout_id is not None
@@ -1858,6 +1869,32 @@ def apply_rollout_prefix(base_url: str, rollout_id: Optional[str], *, token_capt
     if not rollout_id:
         return base_url
     return base_url.rstrip("/") + rollout_path_prefix(rollout_id, token_capture=token_capture)
+
+
+def direct_http_tool_target(
+    base_url: str, headers: Mapping[str, str], global_config_dict: Any
+) -> tuple[str, dict[str, str]]:
+    """Return the base URL and headers for a tool call through a direct HTTP grant.
+
+    ``ServerClient.request`` attributes a call to a configured Resources Server to the current rollout.
+    A direct HTTP grant names its Resources Server by URL instead, so the Agent applies the same rule here:
+    with observability or checkpointing enabled, inside a rollout, the base URL gets the ``/ng-rollout/<id>``
+    prefix (unless the grant already carries one) and the current tool call travels in ``TOOL_CALL_ID_HEADER``.
+    The grant's server must strip the prefix, as ``RolloutContextMiddleware`` does on every Resources Server.
+    """
+    headers = dict(headers)
+    rollout_id = current_rollout_id()
+    attribute_rollout = bool(global_config_dict.get(OBSERVABILITY_ENABLED_KEY_NAME, False)) or (
+        checkpoint_settings(global_config_dict) is not None
+    )
+    if rollout_id is None or not attribute_rollout:
+        return base_url, headers
+    if f"/{ROLLOUT_PATH_PREFIX}/" not in urlsplit(base_url).path:
+        base_url = apply_rollout_prefix(base_url, rollout_id)
+    tool_call_id = current_tool_call_id()
+    if tool_call_id is not None:
+        headers[TOOL_CALL_ID_HEADER] = tool_call_id
+    return base_url, headers
 
 
 def setup_server_client(head_server_config: Optional[BaseServerConfig] = None) -> ServerClient:  # pragma: no cover

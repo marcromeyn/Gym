@@ -15,6 +15,8 @@
 """Provider-neutral public sandbox API."""
 
 import asyncio
+import re
+import sys
 import tempfile
 import threading
 import time
@@ -22,6 +24,7 @@ import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeoutError
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -57,6 +60,52 @@ SYNC_OPERATION_TIMEOUT_S = 3600.0
 # Matches the providers' non-process exec sentinel (see docker provider).
 SANDBOX_PTY_RUNTIME_RETURN_CODE = 125
 SYNC_LOOP_CLOSE_TIMEOUT_S = 5.0
+
+#: Span attributes joining a sandbox operation to its rollout and to the model tool call it ran for.
+#: The rollout attribute is the one Gym's HTTP and endpoint spans carry
+#: (``nemo_gym.telemetry.endpoints.ROLLOUT_ID_ATTRIBUTE``); the tool call attribute is the
+#: OpenTelemetry GenAI semantic convention.
+ROLLOUT_ID_ATTRIBUTE = "nemo.gym.rollout.id"
+TOOL_CALL_ID_ATTRIBUTE = "gen_ai.tool.call.id"
+#: ``SandboxSpec.metadata`` keys added at create time inside a rollout. Explicit spec metadata wins.
+#: Providers that turn metadata into labels (Daytona, E2B, OpenSandbox, OpenShell) make a sandbox
+#: listable by rollout; providers that ignore metadata are unaffected.
+ROLLOUT_ID_METADATA_KEY = "nemo-gym.nvidia.com/rollout-id"
+TOOL_CALL_ID_METADATA_KEY = "nemo-gym.nvidia.com/tool-call-id"
+# A Kubernetes label value, the strictest label store a provider maps metadata onto. An id that does
+# not fit is left out of the labels rather than truncated into a value no other record carries.
+_LABEL_VALUE_PATTERN = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$")
+
+
+def _rollout_ids() -> tuple[str | None, str | None]:
+    """The current rollout capture key and tool call id; a tool call counts only inside a rollout."""
+    # Only code that imported ``nemo_gym.rollout_correlation`` can have set a rollout context. Looking
+    # it up instead of importing it keeps the server stack it depends on out of standalone sandbox use.
+    correlation = sys.modules.get("nemo_gym.rollout_correlation")
+    rollout_id = correlation.current_rollout_id() if correlation is not None else None
+    return (rollout_id, correlation.current_tool_call_id()) if rollout_id is not None else (None, None)
+
+
+def _rollout_span_attributes() -> dict[str, str | None]:
+    rollout_id, tool_call_id = _rollout_ids()
+    return {ROLLOUT_ID_ATTRIBUTE: rollout_id, TOOL_CALL_ID_ATTRIBUTE: tool_call_id}
+
+
+def _with_rollout_metadata(spec: SandboxSpec) -> SandboxSpec:
+    rollout_id, tool_call_id = _rollout_ids()
+    labels = {
+        key: value
+        for key, value in ((ROLLOUT_ID_METADATA_KEY, rollout_id), (TOOL_CALL_ID_METADATA_KEY, tool_call_id))
+        if value is not None and _LABEL_VALUE_PATTERN.match(value)
+    }
+    return replace(spec, metadata={**labels, **spec.metadata}) if labels else spec
+
+
+def _with_rollout_ids(result: SandboxExecResult) -> SandboxExecResult:
+    rollout_id, tool_call_id = _rollout_ids()
+    if rollout_id is None or not isinstance(result, SandboxExecResult):
+        return result
+    return replace(result, rollout_id=rollout_id, tool_call_id=tool_call_id)
 
 
 def _pty_timeout_result(command: str, timeout_s: float | int | None, *, reusable: bool) -> SandboxExecResult:
@@ -260,6 +309,36 @@ class SandboxPty:
         unread output behind, so discard the session rather than reusing it (an
         implicitly reused session is retired automatically).
         """
+        result = await self._exec(
+            command,
+            session=session,
+            cwd=cwd,
+            env=env,
+            timeout_s=timeout_s,
+            user=user,
+            rows=rows,
+            cols=cols,
+            pty=pty,
+            detach=detach,
+            poll_interval_s=poll_interval_s,
+        )
+        return _with_rollout_ids(result)
+
+    async def _exec(
+        self,
+        command: str,
+        *,
+        session: SandboxPtySession | None,
+        cwd: str | None,
+        env: dict[str, str] | None,
+        timeout_s: int | float | None,
+        user: str | int | None,
+        rows: int,
+        cols: int,
+        pty: bool,
+        detach: bool,
+        poll_interval_s: float,
+    ) -> SandboxExecResult:
         if detach:
             return await self._exec_detached(
                 command,
@@ -431,6 +510,7 @@ class AsyncSandbox:
         requested_spec = spec if spec is not None else self._spec
         if requested_spec is None:
             raise ValueError("Sandbox.start() requires a SandboxSpec")
+        create_spec = _with_rollout_metadata(requested_spec)
 
         if is_span_group_enabled(GymSpanGroup.SANDBOX):
             provider_name = self._telemetry_provider_name()
@@ -438,16 +518,16 @@ class AsyncSandbox:
             with managed_span(
                 GymSpanGroup.SANDBOX,
                 "gym.sandbox.start",
-                **{"nemo.gym.sandbox.provider": provider_name},
+                **{"nemo.gym.sandbox.provider": provider_name, **_rollout_span_attributes()},
             ) as span:
-                handle = await self._provider.create(requested_spec)
+                handle = await self._provider.create(create_spec)
                 if span is not None:
                     safe_set_span_attributes(span, {"nemo.gym.sandbox.id": _sandbox_id(handle)})
             record_sandbox_startup((time.perf_counter() - started) * 1000.0, provider=provider_name)
             record_sandbox_active(1, provider=provider_name)
             self._counted_active = True
         else:
-            handle = await self._provider.create(requested_spec)
+            handle = await self._provider.create(create_spec)
         self._handle = handle
         self._spec = requested_spec
         self._stopped = False
@@ -520,7 +600,7 @@ class AsyncSandbox:
         with managed_span(
             GymSpanGroup.SANDBOX,
             "gym.sandbox.exec",
-            **{"nemo.gym.sandbox.provider": provider_name},
+            **{"nemo.gym.sandbox.provider": provider_name, **_rollout_span_attributes()},
         ) as span:
             result = await self._exec_uninstrumented(
                 command,
@@ -555,20 +635,22 @@ class AsyncSandbox:
         if preserve_background_services and isinstance(self._provider, SupportsSandboxBackgroundServices):
             if env is not None or user is not None:
                 raise ValueError("Service-preserving execution does not support per-command env or user overrides")
-            return await self._provider.exec_with_background_services(
+            result = await self._provider.exec_with_background_services(
                 self._require_handle(),
                 command,
                 cwd=cwd if cwd is not None else self._spec.workdir if self._spec is not None else None,
                 timeout_s=timeout_s,
             )
-        return await self._provider.exec(
-            self._require_handle(),
-            command,
-            cwd=cwd if cwd is not None else self._spec.workdir if self._spec is not None else None,
-            env=env,
-            timeout_s=timeout_s,
-            user=user,
-        )
+        else:
+            result = await self._provider.exec(
+                self._require_handle(),
+                command,
+                cwd=cwd if cwd is not None else self._spec.workdir if self._spec is not None else None,
+                env=env,
+                timeout_s=timeout_s,
+                user=user,
+            )
+        return _with_rollout_ids(result)
 
     async def upload(self, local_path: Path | str, remote_path: str) -> None:
         await self._provider.upload_file(self._require_handle(), Path(local_path), remote_path)
@@ -640,6 +722,7 @@ class AsyncSandbox:
                     **{
                         "nemo.gym.sandbox.provider": self._telemetry_provider_name(),
                         "nemo.gym.sandbox.id": _sandbox_id(self._handle),
+                        **_rollout_span_attributes(),
                     },
                 ):
                     await self._provider.close(self._handle)

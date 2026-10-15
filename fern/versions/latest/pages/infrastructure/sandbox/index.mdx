@@ -266,6 +266,28 @@ spec = SandboxSpec(
 
 Unknown resource keys raise a `ValueError`, which catches config drift early.
 
+## Rollout Attribution
+
+Inside a rollout, `AsyncSandbox` and `Sandbox` record which rollout, and which model tool call, an operation ran for. The rollout is the capture key that `current_rollout_id()` already tracks (`{task}-{rollout}[-a{n}]` or `_ng_rollout_id`). The tool call is the model's function-call `call_id`, available from `current_tool_call_id()`. Simple Agent sets it while it calls a tool, either on its configured `resources_server` or through a direct HTTP grant from the Environment Server. The call carries it in the `x-ng-tool-call-id` header beside the `/ng-rollout/<id>/` prefix, so it reaches only Resources Servers that receive the rollout prefix (observability or checkpointing enabled). `ServerClient` adds both for a configured Resources Server, and `direct_http_tool_target()` from `nemo_gym.server_utils` adds both to a direct HTTP grant. An Agent's prefixed `/v1/responses` request runs in its rollout, so the tool calls it makes are attributed even though `/run` reaches it through a separate HTTP request. Your own code can set it with `tool_call_context(call_id)` from `nemo_gym.rollout_correlation`.
+
+The IDs appear in three places:
+
+- `SandboxExecResult.rollout_id` and `SandboxExecResult.tool_call_id` on results from `exec()` and `pty.exec()`.
+- The `gym.sandbox.start`, `gym.sandbox.exec`, and `gym.sandbox.stop` spans, as `nemo.gym.rollout.id` and `gen_ai.tool.call.id`. Spans exist only when the `sandbox` span group is enabled.
+- `SandboxSpec.metadata` at create time, as `nemo-gym.nvidia.com/rollout-id` and `nemo-gym.nvidia.com/tool-call-id`. Metadata you set explicitly wins. An ID that is not a valid Kubernetes label value (at most 63 characters, starting and ending with a letter or digit) is left out of metadata rather than truncated.
+
+| Provider | Where the IDs land at create time |
+| --- | --- |
+| Daytona | Sandbox labels |
+| E2B | Sandbox metadata |
+| OpenSandbox | Sandbox metadata, which becomes Kubernetes labels next to the attribution labels |
+| OpenShell | Sandbox labels |
+| Apptainer, Docker, ECS Fargate, Enroot, Local | Not recorded. These providers ignore `SandboxSpec.metadata`. |
+
+The IDs are never added to the sandbox environment, files, or commands, so they do not change what runs inside the sandbox. Outside a rollout, nothing is added. A sandbox started for one tool call and reused by later calls keeps the labels of the call that created it, while each exec result and span names its own tool call.
+
+Context variables follow the task that set them. Work that a request hands to a long-lived background task or thread that it did not create is not attributed.
+
 ## Startup Files and File Transfer
 
 Use `files` for small text files that should exist before the first command runs:

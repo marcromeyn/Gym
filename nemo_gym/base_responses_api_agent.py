@@ -44,7 +44,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseCreateParamsNonStreaming,
 )
 from nemo_gym.reward_profile import AggregateMetricsMixin, compute_aggregate_metrics
-from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body, rollout_context
+from nemo_gym.rollout_correlation import RolloutContextMiddleware, maybe_rollout_id_from_run_body, rollout_context
 from nemo_gym.rollout_observability import AgentObservationBundle
 from nemo_gym.sandbox.access import SandboxAccess
 from nemo_gym.server_utils import (
@@ -238,6 +238,10 @@ class SimpleResponsesAPIAgent(BaseResponsesAPIAgent, AggregateMetricsMixin, Simp
         app = FastAPI()
 
         self.setup_session_middleware(app)
+        # A prefixed /v1/responses is a new request, even when it is /run's own self-call, so the rollout context
+        # /run sets does not reach it. Set it from the prefix for the whole handler, so the tool calls it makes
+        # are attributed to the rollout like its model calls. The twins below still see the prefix.
+        app.add_middleware(RolloutContextMiddleware, strip_prefix=False)
 
         agent_attributes = {"nemo.gym.server.name": self.config.name}
         traced_responses = traced_endpoint(GymSpanGroup.AGENT, "gym.agent.responses", self.responses, agent_attributes)

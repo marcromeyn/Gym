@@ -78,6 +78,12 @@ jq -r 'select(.attributes."nemo.gym.rollout.id") | .attributes."nemo.gym.rollout
 ls <capture_dir>/<rollout_id>.capture.jsonl
 ```
 
+Sandbox spans (`gym.sandbox.start`, `gym.sandbox.exec`, and `gym.sandbox.stop`) carry
+`nemo.gym.rollout.id` too, and `gen_ai.tool.call.id` when the operation ran for a model
+tool call, so a sandbox execution joins its rollout and tool call by ID rather than by time.
+Refer to [Rollout Attribution](/infrastructure/sandbox#rollout-attribution) for how the tool
+call ID reaches the sandbox and which providers also record both IDs as sandbox labels.
+
 ## Span Kinds
 
 Span kind is what tells a backend that a call left one service and arrived at another.

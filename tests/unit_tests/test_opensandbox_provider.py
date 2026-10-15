@@ -1915,6 +1915,33 @@ async def test_create_attribution_disabled(
     assert FakeSandbox.created_kwargs["metadata"] == {}
 
 
+async def test_rollout_context_labels_sit_beside_attribution(
+    fake_opensandbox_sdk: None,
+    clean_attribution_env: None,
+) -> None:
+    from nemo_gym.rollout_correlation import rollout_context, tool_call_context
+    from nemo_gym.sandbox import AsyncSandbox
+
+    provider = opensandbox_provider.OpenSandboxProvider(
+        connection={"request_timeout_s": 10},
+        probe={"command": None},
+        attribution={"team": "cfg-team", "user": "cfg-user", "workload": "cfg-workload", "run": "cfg-run"},
+    )
+
+    with rollout_context("4-2"), tool_call_context("call_abc"):
+        await AsyncSandbox(provider, SandboxSpec(image="image:tag"), owns_provider=False).start()
+
+    assert FakeSandbox.created_kwargs["metadata"] == {
+        "nemo-gym.nvidia.com/team": "cfg-team",
+        "nemo-gym.nvidia.com/user": "cfg-user",
+        "nemo-gym.nvidia.com/workload": "cfg-workload",
+        "nemo-gym.nvidia.com/run": "cfg-run",
+        "nemo-gym.nvidia.com/rollout-id": "4-2",
+        "nemo-gym.nvidia.com/tool-call-id": "call_abc",
+    }
+    assert "nemo-gym.nvidia.com/rollout-id" not in FakeSandbox.created_kwargs["env"]
+
+
 @pytest.mark.parametrize(
     ("key_prefix", "expected_key"),
     [

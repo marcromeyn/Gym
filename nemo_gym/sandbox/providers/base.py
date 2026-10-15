@@ -152,12 +152,19 @@ class SandboxExecResult:
     command. Providers may use a non-process sentinel with ``error_type`` set
     when the sandbox runtime reports an execution failure without a process
     exit code.
+
+    ``rollout_id`` and ``tool_call_id`` identify the rollout (its capture key)
+    and the model tool call the command ran for. ``AsyncSandbox`` sets them
+    from the rollout context; they stay None outside one, and providers leave
+    them unset.
     """
 
     stdout: str | None
     stderr: str | None
     return_code: int
     error_type: str | None = None
+    rollout_id: str | None = None
+    tool_call_id: str | None = None
 
 
 ExecResult = SandboxExecResult

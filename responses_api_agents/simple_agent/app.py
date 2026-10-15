@@ -47,6 +47,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseOutputMessage,
     accumulate_response_usage,
 )
+from nemo_gym.rollout_correlation import tool_call_context
 from nemo_gym.rollout_observability import (
     AgentInvocation,
     AgentObservationBundle,
@@ -56,7 +57,12 @@ from nemo_gym.rollout_observability import (
     TrajectoryToolCall,
     TrajectoryTurn,
 )
-from nemo_gym.server_utils import get_response_json, is_nemo_gym_fastapi_entrypoint, raise_for_status
+from nemo_gym.server_utils import (
+    direct_http_tool_target,
+    get_response_json,
+    is_nemo_gym_fastapi_entrypoint,
+    raise_for_status,
+)
 from nemo_gym.server_utils import request as http_request
 from nemo_gym.tool_access import DirectHTTPToolAccess, MCPToolAccess
 
@@ -284,12 +290,17 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                 else:
                     # Resource-server errors are valid model-visible tool outputs.
                     if tool_access is not None:
+                        # Not a ServerClient call, so apply the rollout prefix and tool call header it would.
+                        with tool_call_context(output_function_call.call_id):
+                            base_url, headers = direct_http_tool_target(
+                                str(tool_access.base_url), tool_access.headers, self.server_client.global_config_dict
+                            )
                         api_response = await http_request(
                             method="POST",
-                            url=f"{str(tool_access.base_url).rstrip('/')}/{output_function_call.name}",
+                            url=f"{base_url.rstrip('/')}/{output_function_call.name}",
                             json=parsed_arguments,
                             cookies=resources_server_cookies,
-                            headers=dict(tool_access.headers),
+                            headers=headers,
                             _internal=True,
                         )
                     else:
@@ -305,12 +316,13 @@ class SimpleAgent(SimpleResponsesAPIAgent):
                                 "Simple Agent received a tool call without direct HTTP tool access "
                                 "or a legacy resources_server configuration"
                             )
-                        api_response = await self.server_client.post(
-                            server_name=self.config.resources_server.name,
-                            url_path=f"/{output_function_call.name}",
-                            json=parsed_arguments,
-                            cookies=resources_server_cookies,
-                        )
+                        with tool_call_context(output_function_call.call_id):
+                            api_response = await self.server_client.post(
+                                server_name=self.config.resources_server.name,
+                                url_path=f"/{output_function_call.name}",
+                                json=parsed_arguments,
+                                cookies=resources_server_cookies,
+                            )
                     tool_output = (await api_response.content.read()).decode()
                     resources_server_cookies = dict(resources_server_cookies or {})
                     resources_server_cookies.update(_cookies(api_response))

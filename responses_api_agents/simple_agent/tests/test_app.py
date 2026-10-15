@@ -39,6 +39,7 @@ from nemo_gym.openai_utils import (
     NeMoGymResponseFunctionToolCall,
 )
 from nemo_gym.rollout_collection import _attach_trajectory_record
+from nemo_gym.rollout_correlation import current_tool_call_id
 from nemo_gym.rollout_observability import TrajectoryRecord
 from nemo_gym.server_utils import ServerClient
 from nemo_gym.tool_access import DirectHTTPToolAccess, MCPStreamableHTTPConnection, MCPToolAccess
@@ -344,12 +345,21 @@ class TestApp:
         )
         assert result.status_code == 200
         assert result.json()["output"][-1]["content"][0]["text"] == "Cold."
+        # Inside the rollout the grant gets the rollout prefix and tool call header ServerClient would add.
         direct_request.assert_awaited_once_with(
             method="POST",
-            url="http://resources:8000/get_weather",
+            url=(
+                "http://resources:8000/ng-rollout/rollout/get_weather"
+                if observability_enabled
+                else "http://resources:8000/get_weather"
+            ),
             json={"city": "San Francisco"},
             cookies={"session_id": "seeded-resource-cookie"},
-            headers={"X-Scoped-Access": "token"},
+            headers=(
+                {"X-Scoped-Access": "token", "x-ng-tool-call-id": "call-1"}
+                if observability_enabled
+                else {"X-Scoped-Access": "token"}
+            ),
             _internal=True,
         )
         assert [item.kwargs["server_name"] for item in server_client.post.await_args_list] == ["model", "model"]
@@ -1122,6 +1132,54 @@ class TestApp:
         # The exception type must be visible to the model — repr(e) on a
         # JSONDecodeError starts with the class name.
         assert "JSONDecodeError" in error_payload["error"]
+
+    async def test_resources_tool_call_runs_in_its_tool_call_context(self) -> None:
+        """Only the Resources Server call for a tool runs in its tool call context, which ServerClient forwards."""
+        server, server_client = _make_agent(observability_enabled=True)
+        client = TestClient(server.setup_webserver())
+        model_outputs = [
+            {
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "my_tool",
+                "arguments": "{}",
+                "type": "function_call",
+                "status": "completed",
+            },
+            {
+                "id": "msg_final",
+                "content": [{"annotations": [], "text": "done", "type": "output_text"}],
+                "role": "assistant",
+                "status": "completed",
+                "type": "message",
+            },
+        ]
+        seen: list[tuple[str, str | None]] = []
+
+        async def post(*, server_name: str, **kwargs):
+            seen.append((server_name, current_tool_call_id()))
+            if server_name == "model":
+                output = model_outputs.pop(0)
+                return _mock_response(
+                    {
+                        "id": f"resp_{output['id']}",
+                        "created_at": 0.0,
+                        "model": "dummy_model",
+                        "object": "response",
+                        "output": [output],
+                        "parallel_tool_calls": True,
+                        "tool_choice": "auto",
+                        "tools": [],
+                    }
+                )
+            return _mock_response(content="tool output")
+
+        server_client.post = AsyncMock(side_effect=post)
+
+        res = client.post("/v1/responses", json={"input": [{"role": "user", "content": "hello"}]})
+
+        assert res.status_code == 200
+        assert seen == [("model", None), ("resources", "call_1"), ("model", None)]
 
     @pytest.mark.parametrize("empty_output", [False, True])
     async def test_responses_stops_without_message_or_tool_calls(self, caplog, empty_output) -> None:

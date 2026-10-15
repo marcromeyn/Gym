@@ -135,6 +135,98 @@ async def test_sandbox_span_never_records_the_command(recorded_spans, started_sa
         assert "SECRET_FLAG" not in str(value)
 
 
+async def test_sandbox_spans_carry_the_rollout_and_tool_call(recorded_spans, started_sandbox):
+    """Joins a sandbox operation to its rollout and tool call without relying on timing."""
+    from nemo_gym.rollout_correlation import rollout_context, tool_call_context
+
+    with rollout_context("4-2"), tool_call_context("call_abc"):
+        sandbox = await started_sandbox().start()
+        await sandbox.exec("echo hi")
+        await sandbox.stop()
+
+    spans = {span.name: span for span in recorded_spans()}
+    for name in ("gym.sandbox.start", "gym.sandbox.exec", "gym.sandbox.stop"):
+        assert spans[name].attributes["nemo.gym.rollout.id"] == "4-2"
+        assert spans[name].attributes["gen_ai.tool.call.id"] == "call_abc"
+
+
+async def test_sandbox_spans_omit_rollout_attributes_outside_a_rollout(recorded_spans, started_sandbox):
+    from nemo_gym.rollout_correlation import tool_call_context
+
+    with tool_call_context("call_abc"):
+        sandbox = await started_sandbox().start()
+        await sandbox.exec("echo hi")
+        await sandbox.stop()
+
+    spans = recorded_spans()
+    assert {span.name for span in spans} >= {"gym.sandbox.start", "gym.sandbox.exec", "gym.sandbox.stop"}
+    for span in spans:
+        assert "nemo.gym.rollout.id" not in span.attributes
+        assert "gen_ai.tool.call.id" not in span.attributes
+
+
+@pytest.mark.parametrize("path", ["/ng-rollout/4-2/v1/responses", "/v1/responses"])
+def test_agent_responses_span_carries_the_rollout_of_a_prefixed_request(recorded_spans, path):
+    """A prefixed ``/v1/responses`` is a new request, so its rollout comes from the path, not from ``/run``."""
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+
+    from fastapi.testclient import TestClient
+
+    from nemo_gym.server_utils import ServerClient
+    from responses_api_agents.simple_agent.app import (
+        ModelServerRef,
+        ResourcesServerRef,
+        SimpleAgent,
+        SimpleAgentConfig,
+    )
+
+    server_client = MagicMock(spec=ServerClient)
+    server_client.global_config_dict = {"observability_enabled": False}
+    model_response = MagicMock(status=200, cookies={}, ok=True)
+    model_response.read = AsyncMock(
+        return_value=json.dumps(
+            {
+                "id": "resp_1",
+                "created_at": 0.0,
+                "model": "policy",
+                "object": "response",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "content": [{"annotations": [], "text": "done", "type": "output_text"}],
+                        "role": "assistant",
+                        "status": "completed",
+                        "type": "message",
+                    }
+                ],
+                "parallel_tool_calls": True,
+                "tool_choice": "auto",
+                "tools": [],
+            }
+        )
+    )
+    server_client.post = AsyncMock(return_value=model_response)
+    agent = SimpleAgent(
+        config=SimpleAgentConfig(
+            host="agent.test",
+            port=80,
+            entrypoint="app.py",
+            name="agent",
+            model_server=ModelServerRef(type="responses_api_models", name="model"),
+            resources_server=ResourcesServerRef(type="resources_servers", name="resources"),
+        ),
+        server_client=server_client,
+    )
+
+    response = TestClient(agent.setup_webserver()).post(path, json={"input": "hi"})
+
+    assert response.status_code == 200, response.text
+    (span,) = [span for span in recorded_spans() if span.name == "gym.agent.responses"]
+    expected = "4-2" if path.startswith("/ng-rollout/") else None
+    assert span.attributes.get("nemo.gym.rollout.id") == expected
+
+
 async def test_sandbox_is_uninstrumented_when_the_group_is_disabled(recorded_spans, started_sandbox):
     from nemo.lens.state import set_enabled_span_groups
 

@@ -824,6 +824,35 @@ async def test_create_timeout_is_not_retried() -> None:
     assert calls == 1
 
 
+async def test_rollout_context_becomes_daytona_labels(fake_daytona_sdk: None) -> None:
+    from nemo_gym.rollout_correlation import rollout_context, tool_call_context
+    from nemo_gym.sandbox import AsyncSandbox
+
+    provider = daytona_provider.DaytonaProvider(probe={"command": None})
+    create_params: list[Any] = []
+
+    async def create_once(spec: SandboxSpec) -> SandboxHandle:
+        create_params.append(provider._to_create_params(spec))
+        return SandboxHandle("sandbox-created", "daytona", raw=object())
+
+    provider._create_once = create_once  # type: ignore[method-assign]
+
+    with rollout_context("4-2"), tool_call_context("call_abc"):
+        await AsyncSandbox(provider, SandboxSpec(image="python:3.12", metadata={"label": "value"})).start()
+    await AsyncSandbox(provider, SandboxSpec(image="python:3.12")).start()
+
+    in_rollout, outside = (params.kwargs for params in create_params)
+    assert in_rollout["labels"] == {
+        "nemo-gym.nvidia.com/rollout-id": "4-2",
+        "nemo-gym.nvidia.com/tool-call-id": "call_abc",
+        "label": "value",
+        daytona_provider.SANDBOX_ID_LABEL: in_rollout["name"],
+    }
+    # Labels are control-plane only: the sandbox's own environment is unchanged.
+    assert "env_vars" not in in_rollout
+    assert outside["labels"] == {daytona_provider.SANDBOX_ID_LABEL: outside["name"]}
+
+
 async def test_create_retries_retryable_verification_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     provider = daytona_provider.DaytonaProvider(create={"retries": 1, "retry_delay_s": 0}, probe={"command": None})
     calls = 0
